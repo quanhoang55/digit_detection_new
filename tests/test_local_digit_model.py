@@ -17,7 +17,7 @@ from roll_qr_scale.digit_postprocess import (
 from roll_qr_scale.storage import MeasurementStore
 
 
-def test_red_led_postprocess_removes_only_unsupported_weak_trailing_box():
+def test_red_led_postprocess_preserves_weak_trailing_box_for_rejection():
     frame = np.zeros((100, 150, 3), dtype=np.uint8)
     digits = []
     for index, value in enumerate((6, 3, 0)):
@@ -28,7 +28,7 @@ def test_red_led_postprocess_removes_only_unsupported_weak_trailing_box():
 
     result = remove_unlit_trailing_digit(frame, digits, display_colors=("red",))
 
-    assert [item.value for item in result] == [6, 3, 0]
+    assert [item.value for item in result] == [6, 3, 0, 0]
 
 
 def test_red_led_postprocess_keeps_illuminated_trailing_zero():
@@ -74,7 +74,7 @@ def test_weak_digit_row_uses_consensus_from_alternate_crop_sizes():
 
 def test_local_model_matches_supplied_checkpoint():
     info = json.loads(Path("model/MODEL-INFO.json").read_text())
-    model = Path("model/best.pt")
+    model = Path(info["source_digit_path"])
     assert model.stat().st_size == info["bytes"]
     assert hashlib.sha256(model.read_bytes()).hexdigest() == info["sha256"]
 
@@ -93,7 +93,9 @@ def test_local_detector_prefers_gross_above_aligned_lower_rows():
 def test_local_yolo_reads_operator_verified_1304_and_qr(tmp_path):
     metadata = json.loads(Path("data/factory_scale_13_04_reference.json").read_text(encoding="utf-8"))
     frame = cv2.imread(str(Path("data") / metadata["image"]))
-    detector = test_ui.LocalDigitDetector(Path("model/best.pt"), 0.2, prefer_top_row=True)
+    from roll_qr_scale.crop_digit_detector import CropModelDigitDetector
+    detector = CropModelDigitDetector(Path("backend/model/best.pt"), Path("backend/model/crop.pt"),
+                                     0.2, prefer_top_row=True, cpu_threads=2)
     store = MeasurementStore(tmp_path / "check.db", tmp_path / "captures")
     service = test_ui.StationUIService(store, None, None, None, weight_engine="local-yolo",
         digit_detector=detector, local_qr_decoder=test_ui.LocalQrDecoder(), digit_inference_confidence=0.35)

@@ -30,26 +30,26 @@ $installedExe = $null
 $stoppedApp = $false
 try {
     $updaterDirectory = Split-Path -Parent $env:TRAMCANQR_UPDATER_FILE
-    $candidates = @((Join-Path $updaterDirectory 'TramCanQR.exe'))
+    $candidates = @((Join-Path $updaterDirectory 'TramCanQRLocal.exe'))
     foreach ($entry in @(Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue)) {
-        if ($entry.DisplayName -eq 'Tram Can QR' -and $entry.InstallLocation) {
-            $candidates += Join-Path $entry.InstallLocation 'TramCanQR.exe'
+        if ($entry.DisplayName -eq 'Tram Can QR Local' -and $entry.InstallLocation) {
+            $candidates += Join-Path $entry.InstallLocation 'TramCanQRLocal.exe'
         }
     }
-    $candidates += Join-Path $env:LOCALAPPDATA 'Programs\TramCanQR\TramCanQR.exe'
+    $candidates += Join-Path $env:LOCALAPPDATA 'Programs\TramCanQRLocal\TramCanQRLocal.exe'
     $installedExe = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
     if (-not $installedExe) {
-        throw 'Khong tim thay TramCanQR.exe da cai. Hay cai bo TramCanQR-Setup.exe truoc.'
+        throw 'Khong tim thay TramCanQRLocal.exe da cai. Hay cai bo TramCanQRLocal-Setup.exe truoc.'
     }
 
     Write-Host 'Dang kiem tra ban moi tren GitHub Release...'
-    $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/huybitvvt/tram-can-qr-render-pilot/releases/latest' -Headers @{ 'User-Agent' = 'TramCanQR-Updater' } -TimeoutSec 30
+    $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/quanhoang55/digit_detection_new/releases/latest' -Headers @{ 'User-Agent' = 'TramCanQR-Updater' } -TimeoutSec 30
     $tag = [string]$release.tag_name
     if ($tag -notmatch '^v(\d+\.\d+\.\d+(?:-rc\d+)?)$') {
         throw "Phien ban GitHub Release khong hop le: $tag"
     }
     $latestVersion = $Matches[1]
-    $installerName = "TramCanQR-Setup-$latestVersion.exe"
+    $installerName = "TramCanQRLocal-Setup-$latestVersion.exe"
     $installerAsset = $release.assets | Where-Object { $_.name -eq $installerName } | Select-Object -First 1
     $checksumAsset = $release.assets | Where-Object { $_.name -eq 'SHA256SUMS.txt' } | Select-Object -First 1
     if (-not $installerAsset -or -not $checksumAsset) {
@@ -63,7 +63,7 @@ try {
         exit 0
     }
 
-    $temporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) ('TramCanQR-update-' + [guid]::NewGuid().ToString('N'))
+    $temporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) ('TramCanQRLocal-update-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
     $installerPath = Join-Path $temporaryDirectory $installerName
     $checksumPath = Join-Path $temporaryDirectory 'SHA256SUMS.txt'
@@ -84,17 +84,17 @@ try {
     if ($actualHash -ne $expectedHash) { throw 'SHA-256 cua bo cai khong khop. Da huy cap nhat.' }
     Write-Host 'Da tai va xac minh SHA-256 thanh cong.'
 
-    $runningApp = Get-Process -Name TramCanQR -ErrorAction SilentlyContinue
+    $runningApp = Get-Process -Name TramCanQRLocal -ErrorAction SilentlyContinue
     if ($runningApp) {
         Write-Host 'Dang dong Tram Can QR cu...'
         $runningApp | Stop-Process -Force
         $stoppedApp = $true
         foreach ($attempt in 1..20) {
-            if (-not (Get-Process -Name TramCanQR -ErrorAction SilentlyContinue)) { break }
+            if (-not (Get-Process -Name TramCanQRLocal -ErrorAction SilentlyContinue)) { break }
             Start-Sleep -Milliseconds 250
         }
-        if (Get-Process -Name TramCanQR -ErrorAction SilentlyContinue) {
-            throw 'Khong dong duoc TramCanQR.exe. Hay dong ung dung va thu lai.'
+        if (Get-Process -Name TramCanQRLocal -ErrorAction SilentlyContinue) {
+            throw 'Khong dong duoc TramCanQRLocal.exe. Hay dong ung dung va thu lai.'
         }
     }
 
@@ -103,19 +103,19 @@ try {
     if ($setup.ExitCode -ne 0) { throw "Bo cai tra ma loi $($setup.ExitCode)." }
 
     Write-Host "Da cap nhat len ban $latestVersion. Dang mo Tram Can QR..."
-    Start-Process -FilePath $installedExe
+    Start-Process -FilePath $installedExe -WindowStyle Hidden
     $stoppedApp = $false
 } catch {
     Write-Host ('[LOI] ' + $_.Exception.Message) -ForegroundColor Red
     if ($stoppedApp -and $installedExe -and (Test-Path -LiteralPath $installedExe -PathType Leaf)) {
-        try { Start-Process -FilePath $installedExe } catch { Write-Host ('Khong mo lai duoc ung dung: ' + $_.Exception.Message) -ForegroundColor Red }
+        try { Start-Process -FilePath $installedExe -WindowStyle Hidden } catch { Write-Host ('Khong mo lai duoc ung dung: ' + $_.Exception.Message) -ForegroundColor Red }
     }
     if (-not $env:TRAMCANQR_UPDATER_NONINTERACTIVE) { [void](Read-Host 'Nhan Enter de dong cua so') }
     exit 1
 } finally {
     if ($temporaryDirectory -and (Test-Path -LiteralPath $temporaryDirectory)) {
         $resolvedTemporary = [IO.Path]::GetFullPath($temporaryDirectory)
-        $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\TramCanQR-update-'
+        $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\TramCanQRLocal-update-'
         if ($resolvedTemporary.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
             Remove-Item -LiteralPath $resolvedTemporary -Recurse -Force -ErrorAction SilentlyContinue
         }

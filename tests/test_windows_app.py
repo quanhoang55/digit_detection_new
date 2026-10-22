@@ -197,6 +197,7 @@ def test_local_upgrade_uses_existing_data_identity_and_bundled_model(tmp_path, m
     model = assets / "model/best.pt"
     model.parent.mkdir(parents=True)
     model.write_bytes(b"fixture")
+    (model.parent / "crop.pt").write_bytes(b"crop-fixture")
     root = tmp_path / "TramCanQR"
     args = build_parser().parse_args(build_local_argv(root, assets))
     assert args.weight_engine == "local-yolo" and args.weight_burst_frames == 1
@@ -248,7 +249,7 @@ def test_upgrade_refuses_corrupt_database_without_marking_backup_complete(tmp_pa
     database.write_bytes(b"corrupt-database")
     with pytest.raises(sqlite3.DatabaseError):
         backup_before_local_upgrade(tmp_path, None)
-    assert not (tmp_path / "backups/local-rc75.json").exists()
+    assert not (tmp_path / "backups/local2-rc81.json").exists()
     assert database.read_bytes() == b"corrupt-database"
 
 

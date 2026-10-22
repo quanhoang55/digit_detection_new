@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 
 import cv2
@@ -20,7 +21,7 @@ from roll_qr_scale.windows_app import APP_VERSION
 
 def main():
     project = Path(__file__).resolve().parents[1]
-    executable = project / "dist/TramCanQR/TramCanQR.exe"
+    executable = project / "dist/TramCanQRLocal/TramCanQRLocal.exe"
     metadata = json.loads((project / "data/factory_scale_13_04_reference.json").read_text(encoding="utf-8"))
     sample = project / "data" / metadata["image"]
     frame = cv2.imread(str(sample))
@@ -35,6 +36,11 @@ def main():
             store.attach_product_weight(row.event_id, 13.04)
             store.connection.execute("UPDATE measurements SET sync_status=? WHERE event_id=?", (state, row.event_id))
             store.connection.commit()
+        draft_id = str(uuid.uuid4())
+        store.save_photo_draft_idempotent(frame, capture_kind="product", event_id=draft_id,
+            parent_event_id=str(uuid.uuid4()), station_id="station-04", camera_id="camera-04")
+        original_draft = tuple(store.connection.execute(
+            "SELECT * FROM photo_drafts WHERE event_id=?", (draft_id,)).fetchone())
         before = [tuple(row) for row in store.connection.execute("SELECT * FROM measurements ORDER BY id")]
         store.close()
         staging = station / "data/captures/.staging"
@@ -73,7 +79,7 @@ def main():
             status = None
             while time.monotonic() < deadline:
                 if process.poll() is not None:
-                    raise RuntimeError((station / "logs/app.log").read_text(encoding="utf-8", errors="replace")[-5000:])
+                    raise RuntimeError((station / "logs/local.log").read_text(encoding="utf-8", errors="replace")[-5000:])
                 try:
                     status = request("/api/status")
                     break
@@ -85,11 +91,12 @@ def main():
             assert config.read_bytes() == original_config
             with closing(sqlite3.connect(station / "data/measurements.db")) as database:
                 assert database.execute("SELECT * FROM measurements ORDER BY id").fetchall() == before
-            marker = json.loads((station / "backups/local-rc75.json").read_text(encoding="utf-8"))
+            marker = json.loads((station / "backups/local2-rc81.json").read_text(encoding="utf-8"))
             backup = Path(marker["directory"])
             assert (backup / "config.env").read_bytes() == original_config
             with closing(sqlite3.connect(backup / "measurements.db")) as database:
                 assert database.execute("SELECT * FROM measurements ORDER BY id").fetchall() == before
+                assert database.execute("SELECT * FROM photo_drafts WHERE event_id=?", (draft_id,)).fetchone() == original_draft
             assert all(hashlib.sha256(path.read_bytes()).hexdigest() == digest for path, digest in old_files.items())
             print("PASS: frozen in-place startup; old pending/failed rows, both photos, staging, station04 and cloud config retained; DB/config backup verified", flush=True)
             result = request("/api/analyze", {"image": "data:image/jpeg;base64," + base64.b64encode(sample.read_bytes()).decode(), "unit": "kg", "roi": "auto"})
@@ -102,9 +109,66 @@ def main():
             with closing(sqlite3.connect(station / "data/measurements.db")) as database:
                 assert database.execute("SELECT * FROM measurements ORDER BY id").fetchall() == before
             print("PASS: old gemini setting and missing external model overridden by bundled CPU YOLO; reads 13.04 kg + QR; no cloud writes", flush=True)
+            image = "data:image/jpeg;base64," + base64.b64encode(sample.read_bytes()).decode()
+            local_event = str(uuid.uuid4())
+            saved = request("/api/capture", {
+                "event_id": local_event, "qr_code": "LOCAL-SHARED-TEST", "weight": 0.67,
+                "product_weight": 13.04, "unit": "kg", "image": image, "product_image": image,
+                "vision_confirmed": True, "weight_raw": "LOCAL YOLO; SOURCE_MACHINE=M1",
+                "machine": "M1", "station_id": "station-04", "camera_id": "camera-04",
+            })
+            assert saved["event_id"] == local_event
+            with closing(sqlite3.connect(station / "data/measurements.db")) as database:
+                assert database.execute("SELECT COUNT(*) FROM measurements").fetchone() == (3,)
+            print("PASS: frozen local EXE saves a new measurement beside both legacy rows", flush=True)
         finally:
             process.terminate()
             process.wait(timeout=20)
+
+        # An installed rc80 is deliberately untouched. Exercise its existing
+        # executable in this same sandbox, then reopen local with its new row.
+        gemini_exe = Path(os.environ.get("TRAMCAN_GEMINI_TEST_EXE", str(
+            project.parent / "train_thigiacAI/dist/TramCanQR/TramCanQR.exe")))
+        if not gemini_exe.is_file():
+            raise FileNotFoundError("Set TRAMCAN_GEMINI_TEST_EXE to the verified rc80 executable")
+        for label, exe, expected_engine in (("Gemini rc80", gemini_exe, "gemini"),
+                                             ("Local rc81", executable, "local-yolo")):
+            process = subprocess.Popen([str(exe)], cwd=base, env=env,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            try:
+                deadline = time.monotonic() + 90
+                status = None
+                while time.monotonic() < deadline:
+                    assert process.poll() is None, f"{label} exited during startup"
+                    try:
+                        status = request("/api/status")
+                        break
+                    except OSError:
+                        time.sleep(.2)
+                assert status and status["weight_engine"] == expected_engine
+                assert status["gateway_id"] == "gateway-04"
+                # Read through the application's real local records endpoint.
+                rows = request("/api/measurements?local_only=1&limit=50")["items"]
+                assert local_event in {row["event_id"] for row in rows}, label
+                if expected_engine == "gemini":
+                    gemini_event = str(uuid.uuid4())
+                    saved = request("/api/capture", {
+                        "event_id": gemini_event, "qr_code": "GEMINI-SHARED-TEST", "weight": .75,
+                        "product_weight": 13.04, "unit": "kg", "image": image, "product_image": image,
+                        "machine": "M1", "station_id": "station-04", "camera_id": "camera-04",
+                    })
+                    assert saved["event_id"] == gemini_event
+                else:
+                    assert gemini_event in {row["event_id"] for row in rows}
+                assert config.read_bytes() == original_config
+                with closing(sqlite3.connect(station / "data/measurements.db")) as database:
+                    assert database.execute("SELECT * FROM photo_drafts WHERE event_id=?", (draft_id,)).fetchone() == original_draft
+                assert all(hashlib.sha256(path.read_bytes()).hexdigest() == digest
+                           for path, digest in old_files.items() if path.suffix == ".jpg")
+                print(f"PASS: {label} reads shared rows; bidirectional saves, config and original photos retained", flush=True)
+            finally:
+                process.terminate()
+                process.wait(timeout=20)
 
 
 if __name__ == "__main__":

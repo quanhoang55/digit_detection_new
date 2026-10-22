@@ -9,7 +9,7 @@ datas = [
     (str(project_root / "data" / "viet_nhat_ipt_logo.jpg"), "assets/data"),
     (str(project_root / "frontend" / "index.html"), "assets/frontend"),
     (str(project_root / "frontend" / "fonts"), "assets/frontend/fonts"),
-    (str(project_root / "model" / "best.pt"), "assets/model"),
+    (str(project_root / "backend" / "model" / "best.pt"), "assets/model"),
     (str(project_root / "backend" / "model" / "crop.pt"), "assets/model"),
 ]
 binaries = []
@@ -32,8 +32,8 @@ a = Analysis(
     noarchive=False,
 )
 pyz = PYZ(a.pure)
-exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="TramCanQR",
+exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="TramCanQRLocal",
           debug=False, bootloader_ignore_signals=False, strip=False, upx=False,
           console=False, disable_windowed_traceback=False,
           version=str(project_root / "packaging" / "TramCanQR.version"))
-coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="TramCanQR")
+coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="TramCanQRLocal")

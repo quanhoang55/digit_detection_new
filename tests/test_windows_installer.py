@@ -7,8 +7,11 @@ ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = (ROOT / "packaging" / "TramCanQR.iss").read_text(encoding="utf-8")
 
 
-def test_installer_keeps_stable_upgrade_identity_and_customer_data() -> None:
-    assert "AppId={{78F30B4A-47A5-4B9C-A183-E6B7E5E5A241}" in INSTALLER
+def test_local_installer_has_separate_identity_and_shared_customer_data() -> None:
+    assert "AppId={{B96B5974-E2C3-4F28-AC45-9802F32AB683}" in INSTALLER
+    assert "78F30B4A-47A5-4B9C-A183-E6B7E5E5A241" not in INSTALLER
+    assert "DefaultDirName={localappdata}\\Programs\\TramCanQRLocal" in INSTALLER
+    assert 'MyAppExeName "TramCanQRLocal.exe"' in INSTALLER
     assert "if FileExists(ConfigPath) then" in INSTALLER
     assert "Exit;" in INSTALLER
     assert "{localappdata}\\TramCanQR\\config.env" in INSTALLER
@@ -43,4 +46,4 @@ def test_first_install_opens_config_before_starting_the_gateway() -> None:
     assert 'Filename: "{sys}\\notepad.exe"' in INSTALLER
     assert 'InitialConfigCreated := True' in INSTALLER
     run_section = INSTALLER.split('[Run]', 1)[1].split('[Code]', 1)[0]
-    assert run_section.index('Filename: "{sys}\\notepad.exe"') < run_section.index('Filename: "{app}\\{#MyAppExeName}"')
+    assert run_section.index('Filename: "{sys}\\notepad.exe"') < run_section.index('CHUYEN-BAN.ps1')

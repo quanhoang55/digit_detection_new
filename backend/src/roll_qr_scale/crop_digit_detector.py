@@ -15,8 +15,9 @@ from backend.cv.digit_detector import (
     DetectionRun,
     DigitDetector,
     _reading_score,
+    top_display_rows,
 )
-from backend.cv.display_locator import DisplayRegion
+from backend.cv.display_locator import DisplayRegion, locate_display_candidates, scaled_region
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +127,11 @@ class CropModelDigitDetector(DigitDetector):
             if region.width >= 20 and region.height >= 10:
                 regions.append((region, float(score)))
 
+        if self.prefer_top_row:
+            # Gross is the top aligned scale row. Never select a readable
+            # tare/net row merely because its zeros have higher confidence.
+            top_rows = top_display_rows([region for region, _ in regions])
+            regions = [(region, score) for region, score in regions if region in top_rows]
         regions.sort(key=lambda item: item[1], reverse=True)
         return regions[: self.max_candidates]
 
@@ -142,20 +148,46 @@ class CropModelDigitDetector(DigitDetector):
                 self.model_version,
             )
 
-        best: tuple[float, DisplayRegion, float, list, int] | None = None
+        # Anchor to the strongest trained Gross box. A tall secondary box
+        # spanning two rows must not reintroduce tare/net as an alternative.
+        anchor, anchor_confidence = candidates[0]
+        candidates = [(anchor, anchor_confidence, "original")]
+        contexts = top_display_rows(locate_display_candidates(
+            image, colors=self.display_colors, max_candidates=self.max_candidates))
+        for context in contexts:
+            region = scaled_region(context, 0.7, image.shape)
+            overlap = max(0, min(region.x2, anchor.x2) - max(region.x1, anchor.x1)) * max(
+                0, min(region.y2, anchor.y2) - max(region.y1, anchor.y1))
+            union = region.width * region.height + anchor.width * anchor.height - overlap
+            # Recover context cut tightly by crop.pt, only on the same row.
+            # The digit checkpoint remains the colleague's second model.
+            if union and overlap / union >= 0.5 and region != anchor:
+                candidates.append((region, anchor_confidence, "original"))
+                candidates.append((region, anchor_confidence, "sharpened"))
+                break
+
+        best: tuple[float, DisplayRegion, float, list, str] | None = None
+        confident_readings: set[str] = set()
         ignored_none_total = 0
-        for region, crop_confidence in candidates:
-            proposals, ignored_none = self._predict_crop(image, region, "original")
+        for region, crop_confidence, preprocessing in candidates:
+            proposals, ignored_none = self._predict_crop(image, region, preprocessing)
             ignored_none_total += ignored_none
-            accepted = [
-                item for item in proposals if item.confidence >= self.confidence
-            ]
+            # A weak digit must reject the whole reading. Removing it here
+            # could turn 6308 into 6.30 before the service checks confidence.
+            accepted = proposals
+            raw = "".join(str(item.value) for item in accepted)
+            if raw.isdecimal() and 3 <= len(raw) <= 6 and min(
+                (item.confidence for item in accepted), default=0) >= self.confidence:
+                confident_readings.add(raw)
             score = _reading_score(region, accepted) + crop_confidence * 0.1
             if best is None or score > best[0]:
-                best = score, region, crop_confidence, accepted, ignored_none
+                best = score, region, crop_confidence, accepted, preprocessing
 
         assert best is not None
-        _, region, crop_confidence, digits, ignored_none = best
+        _, region, crop_confidence, digits, preprocessing = best
+        if len(confident_readings) > 1:
+            # Conflicting complete rows require an operator decision.
+            digits = []
         elapsed_ms = (time.perf_counter() - started) * 1000
         logger.debug(
             "crop.pt display=%s confidence=%.4f digits=%s elapsed_ms=%.1f",
@@ -169,7 +201,7 @@ class CropModelDigitDetector(DigitDetector):
             region,
             len(candidates),
             1.0,
-            "crop.pt",
+            f"crop.pt+{preprocessing}",
             ignored_none_total,
             1 + len(candidates),
             elapsed_ms,

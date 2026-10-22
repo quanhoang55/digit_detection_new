@@ -159,7 +159,7 @@ _LEGACY_DIGIT_MODEL = (
 DEFAULT_DIGIT_MODEL = (
     Path(sys._MEIPASS) / "assets" / "model" / "best.pt"
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
-    else _REPOSITORY_ROOT / "model" / "best.pt"
+    else _REPOSITORY_ROOT / "backend" / "model" / "best.pt"
 )
 if not DEFAULT_DIGIT_MODEL.is_file() and _LEGACY_DIGIT_MODEL.is_file():
     DEFAULT_DIGIT_MODEL = _LEGACY_DIGIT_MODEL

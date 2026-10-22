@@ -1,113 +1,28 @@
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $projectRoot
-
-# 1. Doc phien ban tu packaging\TramCanQR.iss
-$issPath = Join-Path $projectRoot "packaging\TramCanQR.iss"
-if (-not (Test-Path -LiteralPath $issPath)) {
-    throw "Khong tim thay $issPath"
-}
-$match = (Get-Content -LiteralPath $issPath) | Select-String -Pattern '#define MyAppVersion "([^"]+)"'
-if (-not $match) {
-    throw "Khong doc duoc MyAppVersion trong $issPath"
-}
+$repo = 'quanhoang55/digit_detection_new'
+$match = Select-String -LiteralPath packaging\TramCanQR.iss -Pattern '^#define MyAppVersion "([^"]+)"'
 $version = $match.Matches[0].Groups[1].Value
+if (-not $version) { throw 'Khong doc duoc phien ban' }
 $tag = "v$version"
-Write-Host ">>> Dang chuan bi phat hanh phien ban: $tag" -ForegroundColor Cyan
-
-# 2. Kiem tra file bo cai
-$installerDir = Join-Path $projectRoot "dist\installer"
-$versionedInstaller = Join-Path $installerDir "TramCanQR-Setup-$version.exe"
-$genericInstaller = Join-Path $installerDir "TramCanQR-Setup.exe"
-
-if (-not (Test-Path -LiteralPath $versionedInstaller)) {
-    Write-Host ">>> Chua co file $versionedInstaller, dang chay build..." -ForegroundColor Yellow
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectRoot "tools\build_windows.ps1")
+$handoff = Join-Path $projectRoot "dist\handoff-$version"
+$notes = Join-Path $projectRoot "docs\release-notes-$version.md"
+$assets = @('TramCanQRLocal-Setup.exe', "TramCanQRLocal-Setup-$version.exe", 'SHA256SUMS.txt', 'CAP-NHAT-BAN-MOI.cmd') |
+    ForEach-Object { Join-Path $handoff $_ }
+foreach ($file in @($assets) + @($notes)) {
+    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Thieu $file; hay build va kiem chung truoc" }
 }
-
-if (-not (Test-Path -LiteralPath $versionedInstaller)) {
-    throw "Khong tim thay $versionedInstaller sau khi build"
+foreach ($line in [IO.File]::ReadAllLines((Join-Path $handoff 'SHA256SUMS.txt'))) {
+    if ($line -notmatch '^([a-fA-F0-9]{64})  (TramCanQRLocal-Setup[^\\/]*\.exe)$') { throw 'Checksum khong hop le' }
+    $expected = $Matches[1]
+    $file = Join-Path $handoff $Matches[2]
+    if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $expected) { throw "Checksum khong khop $file" }
 }
-
-Copy-Item -LiteralPath $versionedInstaller -Destination $genericInstaller -Force
-
-# 3. Tao hoac cap nhat GitHub Release
-Write-Host ">>> Dang day Release len GitHub..." -ForegroundColor Cyan
-
-$releaseNotes = @"
-Phiên bản $version của Trạm Cân QR Việt Nhật IPT.
-
-### Các cập nhật chính:
-- Luồng cân 4 lượt cho 2 cặp lõi - thành phẩm (cân 2 lõi trước, thành phẩm cân sau).
-- Hỗ trợ nút lưu riêng từng cặp (Lưu riêng cặp 1, Lưu riêng cặp 2).
-- Có thể lưu thành phẩm khi chưa cân lõi; lượt cân lõi còn thiếu được hiển thị rõ.
-- Danh sách hiện bản ghi local ngay sau khi lưu, kể cả lúc đồng bộ cloud chậm.
-- Cài mức tối đa cuộn/đợt riêng theo máy: cách nhiệt 30, bao bì 16, ca chuẩn Đà Nẵng 10; cho xác nhận sớm theo số cuộn đã đồng bộ.
-- Space hoặc nút chụp đếm ngược 3 giây trước khi lấy ảnh camera.
-- Sửa phân trang Danh sách: mỗi trang lấy đúng bản ghi cloud tương ứng, không lặp lại các bản ghi local đã đồng bộ; phiếu chưa đồng bộ vẫn xuất hiện đúng vị trí.
-- Bỏ cảnh báo và chặn lưu khi cân lõi quá 1.2 kg.
-- Ô chọn Máy dạng danh sách gợi ý 5 máy xưởng và cho gõ tay tự do.
-- Luôn có lựa chọn Ca chuẩn Đà Nẵng; ô Máy gõ tay không còn bị machine_id khóa hoặc ghi đè.
-- Máy mặc định và LSX được giữ đúng theo từng trạm; ca đã chọn không bị gợi ý LSX đổi lại.
-- Nút Lưu trả kết quả sau khi ghi local; ảnh và phiếu cân được gửi cloud ở nền, tự thử lại sau lỗi mạng hoặc khi mở lại ứng dụng.
-- Khi bấm Bỏ ảnh/lượt lỗi, cặp tự chuyển về Không lỗi và xóa lý do lỗi cũ.
-- Dữ liệu cũ và config.env được giữ nguyên khi cài đè.
-
-### Tải nhanh:
-- File cài đặt chuẩn (.exe): [TramCanQR-Setup.exe](https://github.com/huybitvvt/tram-can-qr-render-pilot/releases/latest/download/TramCanQR-Setup.exe)
-- File cập nhật 1-click cho máy trạm: [CAP-NHAT-BAN-MOI.cmd](https://github.com/huybitvvt/tram-can-qr-render-pilot/releases/latest/download/CAP-NHAT-BAN-MOI.cmd)
-"@
-$releaseNotesFile = Join-Path $projectRoot "docs\release-notes-$version.md"
-
-$handoffDir = Join-Path $projectRoot "dist\handoff-$version"
-$shaFile = Join-Path $handoffDir "SHA256SUMS.txt"
-$updateScript = Join-Path $projectRoot "packaging\CAP-NHAT-BAN-MOI.cmd"
-if (-not (Test-Path -LiteralPath $shaFile)) {
-    throw "Thieu $shaFile; updater can checksum de xac minh bo cai"
-}
-$expectedHash = (Get-Content -LiteralPath $shaFile | Where-Object { $_ -match "^[A-Fa-f0-9]{64}  TramCanQR-Setup-$([regex]::Escape($version))\.exe$" } | Select-Object -First 1) -split '  ', 2 | Select-Object -First 1
-$actualHash = (Get-FileHash -LiteralPath $versionedInstaller -Algorithm SHA256).Hash
-if (-not $expectedHash -or $expectedHash -ne $actualHash) {
-    throw "SHA256SUMS.txt khong khop bo cai $versionedInstaller; hay build lai truoc khi release"
-}
-$assets = @($versionedInstaller, $genericInstaller, $shaFile)
-if (Test-Path -LiteralPath $updateScript) {
-    $assets += $updateScript
-}
-
-$releaseExists = $false
-$prevPref = $ErrorActionPreference
-try {
-    $ErrorActionPreference = "SilentlyContinue"
-    $null = & gh release view $tag --json tagName 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        $releaseExists = $true
-    }
-} catch {
-    $releaseExists = $false
-} finally {
-    $ErrorActionPreference = $prevPref
-}
-
-if ($releaseExists) {
-    Write-Host ">>> Release $tag da ton tai, dang cap nhat file dinh kem..." -ForegroundColor Yellow
-    & gh release upload $tag $assets --clobber
-} else {
-    Write-Host ">>> Dang tao moi Release $tag..." -ForegroundColor Green
-    if (Test-Path -LiteralPath $releaseNotesFile) {
-        & gh release create $tag $assets --title "Bản phát hành $tag" --notes-file $releaseNotesFile --latest
-    } else {
-        & gh release create $tag $assets --title "Bản phát hành $tag" --notes $releaseNotes --latest
-    }
-}
-
-if ($LASTEXITCODE -eq 0) {
-    Write-Host ""
-    Write-Host "==========================================================" -ForegroundColor Green
-    Write-Host "PHAT HANH THANH CONG LEN GITHUB!" -ForegroundColor Green
-    Write-Host "Duong link tai truc tiep ban moi nhat (khong doi):" -ForegroundColor White
-    Write-Host "https://github.com/huybitvvt/tram-can-qr-render-pilot/releases/latest/download/TramCanQR-Setup.exe" -ForegroundColor Yellow
-    Write-Host "==========================================================" -ForegroundColor Green
-} else {
-    Write-Host "Loi khi phat hanh release bang gh CLI" -ForegroundColor Red
-}
+$dirty = & git status --porcelain
+if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'Can commit va push dung source da kiem chung truoc khi release' }
+& gh release create $tag $assets --repo $repo --verify-tag --draft --title "Tram Can QR Local $tag" --notes-file $notes
+if ($LASTEXITCODE -ne 0) { throw 'Khong tao duoc draft release; khong ghi de release da co' }
+& gh release edit $tag --repo $repo --draft=false --latest
+if ($LASTEXITCODE -ne 0) { throw 'Da tao draft nhung chua phat hanh' }
+Write-Output "https://github.com/$repo/releases/tag/$tag"

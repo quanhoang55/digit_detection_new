@@ -1,8 +1,15 @@
 {
   "filename": "best.pt",
-  "bytes": 20766085,
-  "sha256": "9ed72153375c0ddfd42e247dc0453c95c3c1061b4ab66f397384aa6bb7c8a8e8",
+  "bytes": 5392325,
+  "sha256": "d871ceaed0a284c0aa2e3c965e79f4157e36d0a7b06477af43327bdb3641c3be",
+  "crop_filename": "crop.pt",
+  "crop_bytes": 5448261,
+  "crop_sha256": "5cae6d8709ef81209fdbd3ca03471d1172febd29dcafe52df13f70eac7f00aac",
   "mapping": "model_2: 0='-', 1='.', 2..11='0'..'9'",
-  "supplied_by": "Project owner, 2026-10-20",
+  "source_repository": "https://github.com/quanhoang55/digit_detection_new",
+  "source_commit": "dce040dc25c790371ca98e5a6c6ad6f79ec4ad4b",
+  "source_digit_path": "backend/model/best.pt",
+  "source_crop_path": "backend/model/crop.pt",
+  "supplied_by": "Colleague, second training, selected 2026-10-23",
   "decimal_places": 2
 }

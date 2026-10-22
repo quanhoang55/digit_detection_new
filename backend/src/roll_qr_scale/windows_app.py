@@ -19,7 +19,7 @@ import webbrowser
 from pathlib import Path
 
 APP_NAME = "TramCanQR"
-APP_VERSION = "0.2.0-rc79"
+APP_VERSION = "0.2.0-rc81"
 _FAULT_STREAM = None
 CONFIG_NAME = "config.env"
 PADDLE_MODEL_NAME = "PP-OCRv6_medium_rec"
@@ -217,7 +217,7 @@ def open_existing_server(port: int) -> bool:
     except (OSError, urllib.error.URLError, ValueError):
         return False
     if payload.get("weight_engine") != "local-yolo":
-        raise RuntimeError("Bản Gemini vẫn đang chạy. Hãy lưu xong lượt cân, thoát TramCanQR.exe rồi mở lại bản mới.")
+        raise RuntimeError("Bản Gemini vẫn đang chạy. Hãy lưu xong lượt cân rồi dùng biểu tượng Chuyển sang Trạm Cân Local.")
     if os.environ.get("ROLL_SCALE_OPEN_BROWSER", "1") != "0":
         webbrowser.open(f"http://127.0.0.1:{port}")
     return True
@@ -226,44 +226,37 @@ def open_existing_server(port: int) -> bool:
 def build_local_argv(root: Path, assets: Path) -> list[str]:
     """Upgrade the existing station in place, regardless of its old Gemini setting."""
     model = assets / "model" / "best.pt"
+    if not getattr(sys, "frozen", False) and not model.is_file():
+        model = assets / "backend" / "model" / "best.pt"
     if not model.is_file():
         raise FileNotFoundError(f"Thiếu model số cân trong bộ cài: {model}")
     argv = build_runtime_argv(root, assets)
     argv.extend([
         "--weight-engine", "local-yolo", "--digit-model", str(model), "--weight-burst-frames", "1",
-        "--digit-confidence", os.environ.get("ROLL_SCALE_DIGIT_CONFIDENCE", "0.2"),
-        "--digit-inference-confidence", os.environ.get("ROLL_SCALE_DIGIT_INFERENCE_CONFIDENCE", "0.35"),
+        "--digit-confidence", "0.2",
+        "--digit-inference-confidence", "0.35", "--decimal-places", "2",
     ])
-    configured_crop_model = os.environ.get("ROLL_SCALE_CROP_DIGIT_MODEL", "").strip()
-    crop_model = Path(configured_crop_model).expanduser() if configured_crop_model else assets / "model" / "crop.pt"
-    if configured_crop_model and not crop_model.is_absolute():
-        crop_model = next(
-            (
-                candidate
-                for candidate in (root / crop_model, assets / crop_model)
-                if candidate.is_file()
-            ),
-            root / crop_model,
-        )
-    if configured_crop_model and not crop_model.is_file():
-        raise FileNotFoundError(f"Thiếu model crop màn hình cân: {crop_model}")
-    if crop_model.is_file():
-        argv.extend([
-            "--crop-digit-model", str(crop_model),
-            "--crop-digit-confidence", os.environ.get("ROLL_SCALE_CROP_DIGIT_CONFIDENCE", "0.001"),
-            "--crop-digit-image-size", os.environ.get("ROLL_SCALE_CROP_DIGIT_IMAGE_SIZE", "640"),
-            "--crop-digit-padding", os.environ.get("ROLL_SCALE_CROP_DIGIT_PADDING", "0.12"),
-        ])
+    # Use the trained pair shipped by this release even with old shared config.
+    crop_model = assets / "model" / "crop.pt"
+    if not getattr(sys, "frozen", False) and not crop_model.is_file():
+        crop_model = assets / "backend" / "model" / "crop.pt"
+    if not crop_model.is_file():
+        raise FileNotFoundError(f"Thiếu model tìm màn hình cân trong bộ cài: {crop_model}")
+    argv.extend([
+        "--crop-digit-model", str(crop_model),
+        "--crop-digit-confidence", "0.001", "--crop-digit-image-size", "640",
+        "--crop-digit-padding", "0.12", "--digit-image-size", "736",
+    ])
     return argv
 
 
 def backup_before_local_upgrade(root: Path, config_path: Path | None) -> Path:
     """Snapshot SQLite (including WAL) before the upgraded service opens it."""
-    marker = root / "backups" / "local-rc75.json"
+    marker = root / "backups" / "local2-rc81.json"
     if marker.is_file():
         return Path(json.loads(marker.read_text(encoding="utf-8"))["directory"])
     marker.parent.mkdir(parents=True, exist_ok=True)
-    backup = Path(tempfile.mkdtemp(prefix="before-local-rc75-", dir=marker.parent))
+    backup = Path(tempfile.mkdtemp(prefix="before-local2-rc81-", dir=marker.parent))
     database = root / "data" / "measurements.db"
     if database.is_file():
         with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as source:
@@ -291,7 +284,7 @@ def prepare_paddleocr_model(root: Path) -> None:
 
 def configure_logging(root: Path) -> Path:
     global _FAULT_STREAM
-    log_path = root / "logs" / "app.log"
+    log_path = root / "logs" / "local.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         filename=log_path,
@@ -300,7 +293,7 @@ def configure_logging(root: Path) -> Path:
         encoding="utf-8",
     )
     if _FAULT_STREAM is None:
-        _FAULT_STREAM = (log_path.parent / "native-crash.log").open("a", encoding="utf-8", buffering=1)
+        _FAULT_STREAM = (log_path.parent / "local-native-crash.log").open("a", encoding="utf-8", buffering=1)
         faulthandler.enable(_FAULT_STREAM, all_threads=True)
     return log_path
 

@@ -5,12 +5,14 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Iterable, Sequence
 
-import cv2
 import numpy as np
 
 
 def resolve_weak_crop_disagreement(frame: np.ndarray, run: object, detector: object) -> None:
     """Use two alternate crops to break a low-confidence digit-row tie."""
+
+    if getattr(detector, "roi_method", "") == "crop.pt-weight-display":
+        return
 
     display = getattr(run, "display", None)
     digits = getattr(run, "digits", None)
@@ -73,54 +75,11 @@ def remove_unlit_trailing_digit(
     *,
     display_colors: Iterable[str],
 ) -> list[object]:
-    """Drop a low-confidence trailing box that is not illuminated red.
+    """Preserve every detected digit; confidence decides whether to reject.
 
-    Small red LED displays can produce a spurious final digit from nearby
-    reflections or printed marks. This conservative check only applies to
-    red-display cameras and requires all three signals: a strong prefix, a
-    weak trailing detection, and little red LED evidence inside that box.
+    LED color and box width cannot prove that a weak trailing digit is noise.
+    Dropping it changes both the integer and decimal places (6308 -> 6.30).
+    Retain the weak digit so the caller rejects the entire uncertain reading.
     """
 
-    ordered = sorted(digits, key=lambda item: item.box.x + item.box.width / 2)
-    colors = {str(color).strip().lower() for color in display_colors}
-    if (
-        "red" not in colors
-        or len(ordered) < 4
-        or not all(str(item.value).isdigit() for item in ordered)
-    ):
-        return ordered
-
-    trailing = ordered[-1]
-    prefix = ordered[:-1]
-    prefix_confidence = min(float(item.confidence) for item in prefix)
-    trailing_confidence = float(trailing.confidence)
-    widths = [float(item.box.width) for item in prefix]
-    median_width = float(np.median(widths)) if widths else 0.0
-    if (
-        prefix_confidence < 0.50
-        or trailing_confidence >= 0.50
-        or prefix_confidence - trailing_confidence < 0.08
-        or median_width <= 0
-        or float(trailing.box.width) < median_width * 1.25
-    ):
-        return ordered
-
-    height, width = frame.shape[:2]
-    x1 = max(0, int(np.floor(trailing.box.x)))
-    y1 = max(0, int(np.floor(trailing.box.y)))
-    x2 = min(width, int(np.ceil(trailing.box.x + trailing.box.width)))
-    y2 = min(height, int(np.ceil(trailing.box.y + trailing.box.height)))
-    if x2 <= x1 or y2 <= y1:
-        return ordered
-
-    hsv = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2HSV)
-    hue = hsv[:, :, 0]
-    red_led = (
-        ((hue <= 15) | (hue >= 165))
-        & (hsv[:, :, 1] >= 80)
-        & (hsv[:, :, 2] >= 100)
-    )
-    if float(np.mean(red_led)) > 0.12:
-        return ordered
-
-    return prefix
+    return sorted(digits, key=lambda item: item.box.x + item.box.width / 2)

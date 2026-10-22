@@ -1,16 +1,16 @@
-#define MyAppName "Tram Can QR"
-#define MyAppVersion "0.2.0-rc79"
-#define MyAppExeName "TramCanQR.exe"
+#define MyAppName "Tram Can QR Local"
+#define MyAppVersion "0.2.0-rc81"
+#define MyAppExeName "TramCanQRLocal.exe"
 
 [Setup]
-AppId={{78F30B4A-47A5-4B9C-A183-E6B7E5E5A241}
+AppId={{B96B5974-E2C3-4F28-AC45-9802F32AB683}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher=Viet Nhat IPT
-DefaultDirName={localappdata}\Programs\TramCanQR
+DefaultDirName={localappdata}\Programs\TramCanQRLocal
 DefaultGroupName={#MyAppName}
 OutputDir=..\dist\installer
-OutputBaseFilename=TramCanQR-Setup-{#MyAppVersion}
+OutputBaseFilename=TramCanQRLocal-Setup-{#MyAppVersion}
 Compression=lzma2/fast
 SolidCompression=yes
 PrivilegesRequired=lowest
@@ -18,16 +18,19 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
 [Files]
-Source: "..\dist\TramCanQR\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\TramCanQRLocal\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\packaging\customer-config.env.example"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\packaging\HUONG-DAN-KHACH-HANG.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\model\MODEL-INFO.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\packaging\CAP-NHAT-BAN-MOI.cmd"; DestDir: "{app}"; Flags: ignoreversion
 
+Source: "..\packaging\CHUYEN-BAN.ps1"; DestDir: "{app}"; Flags: ignoreversion
+
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
-Name: "{autodesktop}\Cập nhật Trạm Cân QR"; Filename: "{app}\CAP-NHAT-BAN-MOI.cmd"; Tasks: desktopicon
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\CHUYEN-BAN.ps1"" -Mode Local"
+Name: "{autodesktop}\Chuyển sang Trạm Cân Local"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\CHUYEN-BAN.ps1"" -Mode Local"; Tasks: desktopicon
+Name: "{autodesktop}\Chuyển sang Gemini (dự phòng)"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\CHUYEN-BAN.ps1"" -Mode Gemini"; Tasks: desktopicon
+Name: "{autodesktop}\Cập nhật Trạm Cân Local"; Filename: "{app}\CAP-NHAT-BAN-MOI.cmd"; Tasks: desktopicon
 Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: startupicon
 
 [Tasks]
@@ -36,7 +39,7 @@ Name: "startupicon"; Description: "Tự mở Trạm cân QR khi đăng nhập Wi
 
 [Run]
 Filename: "{sys}\notepad.exe"; Parameters: """{localappdata}\TramCanQR\config.env"""; Description: "Mở cấu hình kết nối Supabase/kho (lần cài đầu)"; Flags: postinstall skipifsilent; Check: ShouldOpenInitialConfig
-Filename: "{app}\{#MyAppExeName}"; Description: "Mở {#MyAppName}"; Flags: nowait postinstall skipifsilent
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""{app}\CHUYEN-BAN.ps1"" -Mode Local"; Description: "Mở {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
 var

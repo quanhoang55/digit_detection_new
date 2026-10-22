@@ -8639,7 +8639,9 @@
             }
             function mappingKey() {
                 return (
-                    CAMERA_MAP_PREFIX +
+                    (!appStatus || appStatus.weight_engine === "local-yolo"
+                        ? "rollQrScale.localCameraMap.v1:"
+                        : CAMERA_MAP_PREFIX) +
                     ((appStatus && appStatus.gateway_id) || "gateway-01")
                 );
             }

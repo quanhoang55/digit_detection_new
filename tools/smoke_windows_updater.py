@@ -1,4 +1,4 @@
-"""Exercise rc74 and new update scripts without touching installed apps/registry."""
+"""Exercise the isolated local updater without touching installed apps/registry."""
 import hashlib
 import json
 import subprocess
@@ -16,15 +16,16 @@ $env:TEMP = $Root
 $env:TMP = $Root
 $env:TRAMCANQR_UPDATER_NONINTERACTIVE = '1'
 $env:TRAMCANQR_UPDATER_FILE = Join-Path $Root 'CAP-NHAT-BAN-MOI.cmd'
-$script:exe = Join-Path $Root 'TramCanQR.exe'
+$script:exe = Join-Path $Root 'TramCanQRLocal.exe'
 $script:didStop = $false
 $script:didInstall = $false
 $script:didOpen = $false
-function Get-ItemProperty { param($Path, $ErrorAction) return @{DisplayName='Tram Can QR';InstallLocation=$Root} }
+function Get-ItemProperty { param($Path, $ErrorAction) return @{DisplayName='Tram Can QR Local';InstallLocation=$Root} }
 function Get-Item { param($LiteralPath) return @{VersionInfo=@{ProductVersion='0.2.0-rc74'}} }
 function Get-Process {
     param($Name, $ErrorAction)
-    if (-not $script:didStop) { return @{Name='TramCanQR'} }
+    if ($Name -ne 'TramCanQRLocal') { throw 'Updater must never inspect or stop Gemini' }
+    if (-not $script:didStop) { return @{Name='TramCanQRLocal'} }
 }
 function Stop-Process {
     param([Parameter(ValueFromPipeline=$true)]$InputObject, [switch]$Force)
@@ -32,8 +33,9 @@ function Stop-Process {
 }
 function Invoke-RestMethod {
     param($Uri, $Headers, $TimeoutSec)
+    if ($Uri -ne 'https://api.github.com/repos/quanhoang55/digit_detection_new/releases/latest') { throw 'Wrong release channel' }
     return @{tag_name='v__TARGET_VERSION__';assets=@(
-        @{name='TramCanQR-Setup-__TARGET_VERSION__.exe';browser_download_url='https://test.invalid/installer'},
+        @{name='TramCanQRLocal-Setup-__TARGET_VERSION__.exe';browser_download_url='https://test.invalid/installer'},
         @{name='SHA256SUMS.txt';browser_download_url='https://test.invalid/checksum'})}
 }
 function Invoke-WebRequest {
@@ -42,7 +44,7 @@ function Invoke-WebRequest {
     else {
         $hash = (Get-FileHash -LiteralPath (Join-Path $Root 'payload.exe') -Algorithm SHA256).Hash
         if ($BadHash) { $hash = '0' * 64 }
-        [IO.File]::WriteAllText($OutFile, $hash + '  TramCanQR-Setup-__TARGET_VERSION__.exe' + "`n")
+        [IO.File]::WriteAllText($OutFile, $hash + '  TramCanQRLocal-Setup-__TARGET_VERSION__.exe' + "`n")
     }
 }
 function Start-Process {
@@ -69,16 +71,13 @@ def main():
     project = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="updater-", dir=project / ".test-tmp") as temp:
         base = Path(temp)
-        legacy = base / "rc74.cmd"
-        legacy.write_bytes(subprocess.check_output([
-            "git", "show", "0f7400468df72213d78923d7d62b8a6dc71de2fc:packaging/CAP-NHAT-BAN-MOI.cmd"], cwd=project))
         harness = base / "harness.ps1"
         harness.write_text(HARNESS.replace("__TARGET_VERSION__", APP_VERSION), encoding="utf-8-sig")
-        for label, updater in (("rc74", legacy), ("current", project / "packaging/CAP-NHAT-BAN-MOI.cmd")):
+        for label, updater in (("local", project / "packaging/CAP-NHAT-BAN-MOI.cmd"),):
             for bad_hash in (False, True):
                 root = base / f"{label}-{bad_hash}"
                 root.mkdir()
-                for name, data in (("TramCanQR.exe", b"old exe"), ("payload.exe", b"new verified installer"),
+                for name, data in (("TramCanQRLocal.exe", b"old exe"), ("payload.exe", b"new verified installer"),
                                    ("config.env", b"old private config"), ("measurements.db", b"old customer DB"), ("old.jpg", b"old photo")):
                     (root / name).write_bytes(data)
                 protected = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in ("config.env", "measurements.db", "old.jpg")}
