@@ -1,0 +1,85 @@
+const {test}=require('node:test');
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const vm=require('node:vm');
+
+const script=require('./frontend_fixture.cjs').html().match(/<script>([\s\S]*?)<\/script>/)[1];
+
+async function analyzeWith(result,kind='core',clientQr='',weightEngine='gemini'){
+ const messages=[],round={saved:false,weight:'',coreImage:''};
+ const session={state:'review',rounds:[round],selectedSlot:{kind:'core',round:0},unit:'kg',stationId:'station-01',cameraId:'camera-01',preview:{},setState(state){this.state=state}};
+ const ctx=vm.createContext({
+  current:()=>session,persistSourceFromFields(){},ensureRounds:()=>session.rounds,sessionRoundCount:()=>session.rounds.length,nextCoreRound:()=>0,nextProductRound:()=>0,captureSlot:()=>session.selectedSlot,
+  roundCoreReady:()=>false,renderControls(){},status:(_node,message)=>messages.push(message),captureStatus:{},
+  captureVideo:()=>null,drawSession:()=> 'image',drawQrSession:()=> 'image',decodeClientQr:async()=>clientQr,newEventId:()=> 'event-01',captureWeightBurst:async()=>[],showPreview(){},
+  weightKindLabel:()=> 'cân lõi',appStatus:{weight_engine:weightEngine},recognitionProfile:{value:'fast'},recognitionProvider:{value:'gemini'},sourceContext:{shift:'HC1'},
+  api:async()=>({...result,event_id:'event-01'}),parseBox:()=>null,qrDuplicateMessage:()=>'',captureQr:{value:''},weight:{value:''},productWeight:{value:''},unit:{value:'kg'},
+  $:()=>null,renderRoundParams(){},updateBoxes(){},syncCaptureProductCodes(){},persistAiMissPhoto:async()=>({saved:true,synced:false}),
+  advanceToNextCapture:()=>null,nextCaptureStep:()=>null,renderEvidence(){},refreshCompletionState(){},weightsReady:()=>false,weighSlotLabel:()=> 'Cân lõi',
+  stopAiCountdown(){},performance:{now:()=>1000},
+ });
+ ctx.requestCaptureAi=payload=>ctx.api('/api/analyze',{body:JSON.stringify(payload)});
+ for(const name of ['roundQrId','validWeightValue','aiDetectedWeight','slotAiPending','ownsAiCapture','syncSessionAliases']){
+  const line=script.split('\n').find(line=>line.startsWith('function '+name+'('));
+  assert.ok(line,name);vm.runInContext(line,ctx);
+ }
+ const start=script.indexOf("async function analyzeCurrent(kind='core')");
+ vm.runInContext(script.slice(start,script.indexOf('\nasync function discardSlot(',start)),ctx);
+ await ctx.analyzeCurrent(kind);
+ return{session,round,messages};
+}
+
+test('conflicting backend and browser QR stays blank instead of restoring browser value',async()=>{
+ const {round,messages}=await analyzeWith({qr_found:false,qr_conflict:true,qr_decoder:'dedicated-decoder-conflict',weight_found:false,quality_pass:true,step_saved:false,unit:'kg'},'product','BROWSER-CODE');
+ assert.equal(round.qr||'','');
+ assert.equal(round.productAnalysis.qr_conflict,true);
+ assert.ok(!messages.some(message=>message.startsWith('LỖI NHẬN DIỆN:')));
+});
+
+test('an AI weight remains visible when image quality fails',async()=>{
+ const {session,round,messages}=await analyzeWith({weight_found:true,weight:7.03,quality_pass:false,step_saved:false,quality:{issues:['ảnh tối']},unit:'kg'});
+ assert.equal(round.weight,'7.03');
+ assert.equal(session.weight,'7.03');
+ assert.match(messages.at(-1),/AI ĐÃ ĐỌC ĐƯỢC CÂN LÕI · 7.03 kg/);
+ assert.match(messages.at(-1),/ảnh tối/);
+});
+
+test('an unreadable core response defaults to zero and records the fallback',async()=>{
+ const {round,messages}=await analyzeWith({weight_found:false,weight:null,quality_pass:true,step_saved:false,quality:{issues:['màn hình cân mờ']},unit:'kg'});
+ assert.equal(round.weight,'0');
+ assert.match(round.analyzedRaw,/CORE_AUTO_ZERO=1/);
+ assert.match(messages.at(-1),/CÂN LÕI TỰ ĐẶT 0/);
+ assert.match(messages.at(-1),/màn hình cân mờ/);
+});
+
+test('local YOLO leaves an unreadable core weight blank for manual confirmation',async()=>{
+ const {round}=await analyzeWith({weight_found:false,weight:null,quality_pass:true,step_saved:false,unit:'kg'},'core','', 'local-yolo');
+ assert.equal(round.weight,'');
+ assert.equal(round.analyzedRaw,'');
+});
+
+test('an unreadable product response stays empty',async()=>{
+ const {round}=await analyzeWith({weight_found:false,weight:null,quality_pass:true,step_saved:false,unit:'kg'},'product');
+ assert.equal(round.productWeight,'');
+});
+
+test('a confirmed blank core reading keeps zero visible in the round and session',async()=>{
+ const {session,round}=await analyzeWith({weight_found:true,weight:0,weight_raw:'CORE_BLANK=1',quality_pass:true,step_saved:false,unit:'kg'});
+ assert.equal(round.weight,'0');
+ assert.equal(session.weight,'0');
+ assert.equal(round.analyzedWeight,0);
+});
+
+test('camera status stops saying analyzing after image analysis completes',()=>{
+ const pill={textContent:'',style:{color:''}},session={state:'analyzing',stream:null,panelStream:null};
+ const ctx=vm.createContext({current:()=>session,$:()=>pill});
+ const line=script.split('\n').find(line=>line.startsWith('function syncCameraStatusPill('));
+ assert.ok(line);
+ vm.runInContext(line,ctx);
+ ctx.syncCameraStatusPill(session);
+ assert.equal(pill.textContent,'Đang phân tích');
+ session.state='awaiting-weight';ctx.syncCameraStatusPill(session);
+ assert.equal(pill.textContent,'Đang chờ ảnh/camera');
+ session.stream={};ctx.syncCameraStatusPill(session);
+ assert.equal(pill.textContent,'Đang hoạt động');
+});

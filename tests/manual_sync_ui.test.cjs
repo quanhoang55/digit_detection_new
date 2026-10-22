@@ -1,0 +1,111 @@
+const {test}=require('node:test');
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const vm=require('node:vm');
+
+const html=require('./frontend_fixture.cjs').html();
+const script=html.match(/<script>([\s\S]*?)<\/script>/)[1];
+const line=name=>script.split('\n').find(value=>value.startsWith(name));
+
+test('production list exposes date/shift/machine filters and push button',()=>{
+  assert.match(html,/id="recordsFilterDate"/);
+  assert.match(html,/id="recordsFilterShift"/);
+  assert.match(html,/id="recordsFilterMachine"/);
+  assert.match(html,/id="recordsFilterProductCode"/);
+  assert.match(html,/id="recordsFilterSync"/);
+  assert.match(html,/id="recordsFilterNhapKho"/);
+  assert.match(html,/function matchesRecordsStatusFilters\(/);
+  assert.match(html,/function recordsListQuery\(/);
+  assert.match(html,/qr_code='\+encodeURIComponent\(productCode\)/);
+  assert.match(html,/id="pushSupabaseBtn"/);
+  assert.match(html,/Đẩy lên Supabase \(không Cloudinary\)/);
+  assert.doesNotMatch(html,/Đồng bộ local → Supabase \/ Cloudinary/);
+});
+
+test('manual sync previews and sends the complete selected filter without Cloudinary',async()=>{
+  const nodes={
+    listDateFrom:{value:'2026-09-25'},listDateTo:{value:'2026-09-26'},
+    listShift:{value:'12C1'},listQrCode:{value:'SP-001'},
+    listMachine:{value:'Máy 11'},listProductionOrder:{value:'LSX-1'},
+    manualSyncScope:{value:'production'},manualSyncStatus:{},
+    manualSyncPreviewBtn:{disabled:false},manualSyncStartBtn:{disabled:false},
+    pushSupabaseBtn:{disabled:false},recordsFilterBtn:{disabled:false},
+    productionRecordsStatus:{hidden:true},
+  };
+  const requests=[];
+  let confirmText='';
+  const ctx=vm.createContext({
+    $:id=>nodes[id],todayLocalDate:()=> '2026-09-26',daysAgoLocalDate:()=> '2026-08-27',
+    status:()=>{},confirm:(message)=>{confirmText=String(message||'');return true},clearTimeout:()=>{},setTimeout:()=>1,
+    workflowMode:'list',
+    sourceContext:{date:'2026-09-26',shift:'12C1',machine:'Máy 11',order:'',bi:0.16},
+    sourceLabel:()=>'label',
+    api:async(path,options)=>{
+      requests.push([path,JSON.parse(options.body)]);
+      return path.endsWith('/preview')
+        ?{total:2,counts:{measurements:2}}
+        :{total:2,state:'running'};
+    },
+  });
+  for(const name of [
+    'function ensureListFilterDefaults(', 'function readListFilters(',
+    'function listFilterLabel(', 'function productionSyncFilters(',
+    'function manualSyncFilters(', 'function activeManualSyncFilters(',
+    'function manualSyncCounts(', 'function setManualSyncRunning(',
+    'function manualSyncStatusEl(',
+    'async function previewManualSync(', 'async function startManualSync(',
+  ]){
+    const source=line(name);
+    assert.ok(source,name);
+    vm.runInContext(source,ctx);
+  }
+  vm.runInContext('let manualSyncTimer=0,manualSyncStatusHost="manualSyncStatus"',ctx);
+  await ctx.startManualSync(false);
+  assert.deepEqual(requests.map(([path])=>path),[
+    '/api/manual-sync/preview','/api/manual-sync/start',
+  ]);
+  assert.deepEqual(requests[0][1],{
+    date_from:'2026-09-25',date_to:'2026-09-26',shift:'12C1',
+    qr_code:'SP-001',machine:'Máy 11',production_order:'LSX-1',scope:'production',
+    skip_cloudinary:true,
+  });
+  assert.deepEqual(requests[1][1],requests[0][1]);
+  assert.equal(nodes.manualSyncStartBtn.disabled,true);
+  assert.match(confirmText,/Supabase/);
+  assert.match(confirmText,/Dòng lỗi không được đẩy/);
+  assert.match(confirmText,/Theo bộ lọc hiện tại/);
+  assert.match(confirmText,/Không đẩy ảnh lên Cloudinary/);
+  assert.doesNotMatch(confirmText,/Supabase \/ Cloudinary/);
+});
+
+test('production sync and list filtering preserve the open capture and use lower filters',async()=>{
+  const upper={date:'2026-10-12',shift:'12C1',machine:'UPPER',order:'LSX-OPEN',bi:0.16,productCode:'OPEN-SP'};
+  const round={eventId:'open',saved:false,coreImage:'core.jpg',productImage:'sp.jpg',coreAiPending:true,weight:'0',productWeight:'',qr:'OPEN-SP_1'};
+  const before=JSON.stringify({upper,round});
+  const nodes={recordsFilterProductCode:{value:'FILTER-SP'},productionRecordsStatus:{hidden:true}};
+  const requests=[];
+  const ctx=vm.createContext({
+    $:id=>nodes[id],sourceContext:upper,stations:[{rounds:[round]}],
+    readRecordsFilterFields:()=>({date:'2026-10-11',shift:'12C2',machine:'LOWER',order:'LSX-OPEN',bi:0.16}),
+    selectedNhapKhoIds:new Set(['saved','draft']),productionRowsByEvent:{saved:{event_id:'saved'},draft:{event_id:'draft',error_only:true}},
+    sourceLabel:fields=>fields.machine,status(){},confirm:()=>true,clearTimeout(){},setTimeout:()=>1,
+    persistSourceFromFields:()=>assert.fail('sync must not persist the capture editor'),
+    saveSourceContext:()=>assert.fail('sync/filter must not change capture metadata'),
+    loadProductionOrders:()=>assert.fail('list filters must not reload the capture order'),
+    loadRecords:async()=>{},
+    api:async(path,options)=>{requests.push([path,JSON.parse(options.body)]);return {total:1,counts:{measurements:1}}},
+  });
+  for(const name of ['function recordsListQuery(', 'async function applyRecordsFilters(','function sourceQuery(','function productionSyncFilters(','function manualSyncCounts(','function setManualSyncRunning(','function manualSyncStatusEl(','async function previewManualSync(','async function startManualSync(']){
+    vm.runInContext(line(name),ctx);
+  }
+  vm.runInContext('let manualSyncTimer=0,manualSyncStatusHost="productionRecordsStatus"',ctx);
+  await ctx.startManualSync(true);
+  await ctx.applyRecordsFilters();
+  assert.deepEqual(requests.map(([path])=>path),['/api/manual-sync/preview','/api/manual-sync/start']);
+  assert.deepEqual(requests[0][1],{date_from:'2026-10-11',date_to:'2026-10-11',shift:'12C2',machine:'LOWER',production_order:'LSX-OPEN',qr_code:'FILTER-SP',scope:'production',skip_cloudinary:true,event_ids:['saved']});
+  assert.equal(JSON.stringify({upper,round}),before);
+  const query=new URLSearchParams(ctx.recordsListQuery());
+  assert.equal(query.get('machine'),'LOWER');
+  assert.equal(query.get('include_drafts'),'0');
+  assert.doesNotMatch(html,/id="photoDraftBackups"|id="photoDraftBody"|id="refreshPhotoDraftsBtn"/);
+});

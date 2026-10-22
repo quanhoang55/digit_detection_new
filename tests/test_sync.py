@@ -1,0 +1,786 @@
+import base64
+import json
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from roll_qr_scale.api_client import post_measurement
+from roll_qr_scale.storage import MeasurementStore
+from roll_qr_scale.sync import IdlePendingSync, OutboxSyncWorker
+
+
+@pytest.fixture
+def automatic_sync_case(tmp_path):
+    store = MeasurementStore(tmp_path / "automatic.db", tmp_path / "captures")
+    sent = []
+
+    def send(url, payload, image_path, token):
+        sent.append(payload["event_id"])
+        return {"ok": True, "event_id": payload["event_id"], "id": len(sent), "cloudinary_skipped": True, "local_backup_committed": True}
+
+    worker = OutboxSyncWorker(store, "https://example.test/ingest", "token", send=send, include_images=False)
+    yield store, worker, sent
+    store.close()
+
+
+def save_automatic_row(store, code, **kwargs):
+    return store.save(code, 1.0, "kg", np.zeros((20, 20, 3), dtype=np.uint8), "manual", **kwargs)
+
+
+def test_automatic_sync_only_sends_pending_rows_before_limit(automatic_sync_case):
+    store, worker, sent = automatic_sync_case
+    failed = save_automatic_row(store, "FAILED", needs_sync=True)
+    store.mark_sync_failed(failed.event_id, "DNS error")
+    local = save_automatic_row(store, "LOCAL", needs_sync=False)
+    synced = save_automatic_row(store, "SYNCED", needs_sync=True)
+    store.mark_synced(synced.event_id, 1)
+    cloudinary = save_automatic_row(store, "CLOUDINARY", needs_sync=True)
+    store.mark_cloudinary_pending(cloudinary.event_id, 2)
+    pending = save_automatic_row(store, "PENDING", needs_sync=True)
+    draft, _ = store.save_photo_draft_idempotent(np.zeros((20, 20, 3), dtype=np.uint8), needs_sync=True)
+    result = worker.sync_pending_when_idle(lambda: True, lambda row: True, limit=1)
+    assert sent == [pending.event_id]
+    assert result == {"attempted": 1, "synced": 1, "failed": 0, "pause": ""}
+    assert store.get(pending.event_id).sync_status == "synced"
+    assert store.get(failed.event_id).sync_status == "failed"
+    assert store.get(local.event_id).sync_status == "local"
+    assert store.get(cloudinary.event_id).sync_error == "cloudinary_pending"
+    assert store.get_photo_draft(draft.event_id).sync_status == "pending"
+
+
+def test_automatic_sync_pauses_for_ai_between_rows_and_rechecks_state(automatic_sync_case):
+    store, worker, sent = automatic_sync_case
+    first = save_automatic_row(store, "FIRST", needs_sync=True)
+    second = save_automatic_row(store, "SECOND", needs_sync=True)
+    result = worker.sync_pending_when_idle(lambda: not sent, lambda row: True)
+    assert sent == [first.event_id]
+    assert result["pause"] == "waiting_ai"
+    # A manual upload completes this row before the next automatic pass.
+    store.mark_synced(second.event_id, 2)
+    worker.sync_pending_when_idle(lambda: True, lambda row: True)
+    assert sent == [first.event_id]
+
+
+def test_automatic_sync_yields_to_manual_upload_and_revalidates_record(automatic_sync_case):
+    store, worker, sent = automatic_sync_case
+    row = save_automatic_row(store, "ROW", needs_sync=True)
+    with worker._sync_lock:
+        result = worker.sync_pending_when_idle(lambda: True, lambda row: True)
+    assert result["pause"] == "waiting_sync"
+    assert sent == []
+    checks = 0
+
+    def idle():
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            store.mark_synced(row.event_id, 3)
+        return True
+
+    worker.sync_pending_when_idle(idle, lambda row: True)
+    assert sent == []
+
+
+def test_automatic_timer_waits_ten_minutes_and_resumes_after_ai_failure(automatic_sync_case):
+    store, worker, sent = automatic_sync_case
+    save_automatic_row(store, "WAITING", needs_sync=True)
+    now = [0.0]
+    idle = [False]
+    timer = IdlePendingSync(worker, lambda: idle[0], lambda row: True, clock=lambda: now[0])
+    now[0] = 599.0
+    timer.tick()
+    assert sent == []
+    now[0] = 600.0
+    timer.tick()
+    assert timer.status()["state"] == "waiting_ai"
+    idle[0] = True
+    now[0] = 601.0
+    timer.tick()
+    assert len(sent) == 1
+    assert timer.status()["next_run_in_seconds"] == 600.0
+    save_automatic_row(store, "NEXT", needs_sync=True)
+    now[0] = 1200.0
+    timer.tick()
+    assert len(sent) == 1
+    now[0] = 1201.0
+    timer.tick()
+    assert len(sent) == 2
+    timer.stop()
+    save_automatic_row(store, "STOPPED", needs_sync=True)
+    now[0] = 1801.0
+    timer.tick()
+    assert len(sent) == 2
+
+
+def test_automatic_upload_failure_is_kept_locally_and_not_retried(automatic_sync_case):
+    store, worker, sent = automatic_sync_case
+    row = save_automatic_row(store, "NETWORK-ERROR", needs_sync=True)
+
+    def fail(*args):
+        sent.append("failed")
+        raise OSError("DNS unavailable")
+
+    worker.send = fail
+    result = worker.sync_pending_when_idle(lambda: True, lambda row: True)
+    assert result["failed"] == 1
+    saved = store.get(row.event_id)
+    assert saved.sync_status == "failed" and Path(saved.image_path).is_file()
+    worker.sync_pending_when_idle(lambda: True, lambda row: True)
+    assert sent == ["failed"]
+
+
+def test_automatic_sync_inventory_pending_only_and_waiting_batch_sources(automatic_sync_case, monkeypatch):
+    store, worker, sent = automatic_sync_case
+    frame = np.zeros((20, 20, 3), dtype=np.uint8)
+    failed, _ = store.save_inventory_check_idempotent("FAILED", 1.0, 0.0, 0.0, "kg", frame, "manual", needs_sync=True)
+    store.mark_inventory_check_failed(failed.event_id, "network")
+    pending, _ = store.save_inventory_check_idempotent("WAITING", 1.0, 0.0, 0.0, "kg", frame, "manual", needs_sync=True)
+    measurement = save_automatic_row(store, "SOURCE", needs_sync=True)
+    batch, _ = store.save_weigh_batch(
+        "2026-10-10", "12C1", "Máy 1", "LSX-1", 10, 10,
+        [{"event_id": measurement.event_id, "qr_code": "SOURCE"}], needs_sync=True,
+    )
+    batch_id = store.pending_weigh_batches()[0]["id"]
+    batch_calls = []
+    monkeypatch.setattr("roll_qr_scale.sync.post_remote_action", lambda *args, **kwargs: batch_calls.append(kwargs) or {"ok": True})
+    worker.sync_pending_when_idle(lambda: True, lambda row: True)
+    assert sent == [pending.event_id, measurement.event_id]
+    assert store.get_inventory_check(failed.event_id).sync_status == "failed"
+    assert store.get_inventory_check(pending.event_id).sync_status == "synced"
+    assert store.get_weigh_batch(batch_id)["sync_status"] == "synced"
+    worker.sync_pending_when_idle(lambda: True, lambda row: True)
+    assert len(batch_calls) == 1
+
+
+def test_local_weigh_batch_prints_before_cloud_and_syncs_later(tmp_path, monkeypatch) -> None:
+    store = MeasurementStore(tmp_path / "measurements.db", tmp_path / "captures")
+    measurement = store.save(
+        "SP_001", 0.82, "kg", np.zeros((80, 100, 3), dtype=np.uint8),
+        "manual", needs_sync=True,
+    )
+    candidates = [{
+        "event_id": measurement.event_id, "qr_code": "SP_001", "ma_san_pham": "SP",
+        "can_loi": 0.82, "can_san_pham": 5.92, "don_vi": "kg",
+        "can_luc": "2026-09-25T10:00:00Z", "trang_thai_loi": "ok",
+    }]
+    item, duplicate = store.save_weigh_batch(
+        "2026-09-25", "HC1", "Máy 1", "LSX-1", 10, 10, candidates,
+        needs_sync=True,
+    )
+    assert duplicate is False
+    assert item["so_luong"] == 1
+    assert item["sync_status"] == "pending"
+    assert store.list_weigh_batches("2026-09-25", "HC1", "Máy 1", "LSX-1")[0]["danh_sach_san_pham"][0]["qr_code"] == "SP_001"
+    store.mark_synced(measurement.event_id, 1, "https://example.test/image.jpg", "img-1")
+    sent = []
+
+    def fake_action(url, token, *, body, timeout=30.0):
+        sent.append(body)
+        return {"ok": True, "item": {"dot_can": 1}}
+
+    monkeypatch.setattr("roll_qr_scale.sync.post_remote_action", fake_action)
+    worker = OutboxSyncWorker(store, "https://example.test/ingest", "token")
+    assert worker.sync_once() == 1
+    assert sent[0]["action"] == "confirm_weighing_batch"
+    assert store.list_weigh_batches("2026-09-25", "HC1", "Máy 1", "LSX-1")[0]["sync_status"] == "synced"
+    store.close()
+
+
+def test_outbox_syncs_committed_measurement(tmp_path) -> None:
+    store = MeasurementStore(tmp_path / "measurements.db", tmp_path / "captures")
+    measurement = store.save(
+        "ROLL-OUTBOX-001",
+        125.4,
+        "kg",
+        np.zeros((80, 100, 3), dtype=np.uint8),
+        "serial",
+        needs_sync=True,
+        gateway_id="gateway-row",
+        station_id="station-01",
+        camera_id="camera-1",
+        analysis_id="analysis-1",
+    )
+    sent: list[tuple] = []
+
+    def fake_send(url, payload, image_path, token, qr_image_path=None):
+        sent.append((url, payload, image_path, token, qr_image_path))
+        return {
+            "ok": True,
+            "event_id": measurement.event_id,
+            "id": 99,
+            "image_url": "https://res.cloudinary.com/demo/image/upload/event.jpg",
+            "image_public_id": "roll-captures/station-01/event",
+        }
+
+    worker = OutboxSyncWorker(
+        store,
+        "https://example.test/ingest",
+        "device-secret",
+        "station-01",
+        send=fake_send,
+    )
+    assert worker.sync_once() == 1
+    saved = store.get(measurement.event_id)
+    store.close()
+
+    assert saved is not None
+    assert saved.sync_status == "synced"
+    assert saved.remote_id == 99
+    assert saved.remote_image_url == "https://res.cloudinary.com/demo/image/upload/event.jpg"
+    assert saved.remote_image_public_id == "roll-captures/station-01/event"
+    assert sent[0][1]["gateway_id"] == "gateway-row"
+    assert sent[0][1]["device_id"] == "gateway-row"
+    assert sent[0][1]["station_id"] == "station-01"
+    assert sent[0][1]["camera_id"] == "camera-1"
+    assert sent[0][1]["analysis_id"] == "analysis-1"
+    assert len(sent[0][1]["frame_sha256"]) == 64
+    assert len(sent[0][1]["payload_hash"]) == 64
+    assert sent[0][1]["qr_code"] == "ROLL-OUTBOX-001"
+    assert "image_path" not in sent[0][1]
+
+
+def test_outbox_accepts_core_image_ack_and_persists_it(tmp_path) -> None:
+    store = MeasurementStore(tmp_path / "measurements.db", tmp_path / "captures")
+    measurement = store.save(
+        "ROLL-CORE-IMAGE-001",
+        1.0,
+        "kg",
+        np.zeros((20, 20, 3), dtype=np.uint8),
+        "camera-gemini:test-ui",
+        needs_sync=True,
+    )
+
+    def fake_send(*args):
+        return {
+            "ok": True,
+            "event_id": measurement.event_id,
+            "id": 101,
+            "core_image_url": "https://images.example/core.jpg",
+            "core_image_public_id": "roll-captures/core-weight/event",
+        }
+
+    worker = OutboxSyncWorker(store, "https://example.test", "token", send=fake_send)
+    assert worker.sync_once() == 1
+    saved = store.get(measurement.event_id)
+    store.close()
+
+    assert saved is not None
+    assert saved.remote_image_url == "https://images.example/core.jpg"
+    assert saved.remote_image_public_id == "roll-captures/core-weight/event"
+
+
+def test_outbox_syncs_inventory_check_to_parallel_workflow(tmp_path) -> None:
+    store = MeasurementStore(tmp_path / "measurements.db", tmp_path / "captures")
+    check, _ = store.save_inventory_check_idempotent(
+        "SP-INVENTORY-SYNC",
+        8.25,
+        0.4,
+        0.16,
+        "kg",
+        np.zeros((40, 60, 3), dtype=np.uint8),
+        "camera-gemini:inventory",
+        needs_sync=True,
+        event_id="3b673ed9-333c-4cab-a85b-a7987c452d80",
+        gateway_id="gateway-row",
+        station_id="station-01",
+        camera_id="camera-01",
+        analysis_id="analysis-inventory",
+    )
+    sent: list[dict[str, object]] = []
+
+    def fake_send(url, payload, image_path, token):
+        sent.append(dict(payload))
+        return {
+            "ok": True,
+            "event_id": check.event_id,
+            "id": 700,
+            "image_url": "https://images.example/inventory.jpg",
+            "image_public_id": "roll-captures/inventory-check/event",
+        }
+
+    worker = OutboxSyncWorker(store, "https://example.test", "token", send=fake_send)
+    assert worker.sync_inventory_event(check.event_id) is True
+    saved = store.get_inventory_check(check.event_id)
+
+    assert saved is not None
+    assert saved.sync_status == "synced"
+    assert saved.remote_id == 700
+    assert sent[0]["workflow"] == "inventory_check"
+    assert sent[0]["product_code"] == "SP-INVENTORY-SYNC"
+    assert sent[0]["core_weight"] == pytest.approx(0.4)
+    assert sent[0]["tare_weight"] == pytest.approx(0.16)
+    store.close()
+
+
+def test_outbox_syncs_photo_draft_without_weight_fields(tmp_path) -> None:
+    store = MeasurementStore(tmp_path / "measurements.db", tmp_path / "captures")
+    draft, _ = store.save_photo_draft_idempotent(
+        np.zeros((40, 60, 3), dtype=np.uint8),
+        qr_code="QR-PHOTO-ONLY",
+        qr_source="camera:zxing",
+        needs_sync=True,
+        event_id="2ab71440-c330-41e8-9682-c940debf74d1",
+        gateway_id="gateway-row",
+        station_id="station-01",
+        camera_id="camera-01",
+    )
+    sent: list[dict[str, object]] = []
+
+    def fake_send(url, payload, image_path, token):
+        sent.append(dict(payload))
+        return {
+            "ok": True,
+            "event_id": draft.event_id,
+            "id": 701,
+            "image_url": "https://images.example/photo-draft.jpg",
+            "image_public_id": "roll-captures/photo-draft/event",
+        }
+
+    worker = OutboxSyncWorker(store, "https://example.test", "token", send=fake_send)
+    assert worker.sync_photo_draft_event(draft.event_id) is True
+    saved = store.get_photo_draft(draft.event_id)
+
+    assert saved is not None and saved.sync_status == "synced"
+    assert sent[0]["workflow"] == "photo_draft"
+    assert sent[0]["status"] == "awaiting_ai"
+    assert sent[0]["qr_code"] == "QR-PHOTO-ONLY"
+    assert "weight" not in sent[0]
+    assert "unit" not in sent[0]
+    store.close()
+
+
+def test_outbox_requires_product_image_ack_for_two_image_event(tmp_path) -> None:
+    store = MeasurementStore(tmp_path / "measurements.db", tmp_path / "captures")
+    measurement = store.save(
+        "ROLL-TWO-IMAGES-001",
+        1.04,
+        "kg",
+        np.zeros((40, 60, 3), dtype=np.uint8),
+        "camera-gemini:test-ui",
+        needs_sync=True,
+        qr_source="camera-product:zxing",
+    )
+    store.attach_product_weight(measurement.event_id, 13.04)
+    product_frame = np.full((50, 70, 3), 240, dtype=np.uint8)
+    store.attach_product_image(measurement.event_id, product_frame)
+    measurement = store.get(measurement.event_id)
+    assert measurement is not None
+    sent_product_images: list[bytes] = []
+
+    def fake_send(url, payload, image_path, token):
+        sent_product_images.append(base64.b64decode(payload["product_image_base64"]))
+        return {
+            "ok": True,
+            "event_id": measurement.event_id,
+            "id": 202,
+            "core_image_url": "https://images.example/core.jpg",
+            "core_image_public_id": "roll-captures/core-weight/event",
+            "product_image_url": "https://images.example/product.jpg",
+            "product_image_public_id": "roll-captures/product-weight/event",
+        }
+
+    worker = OutboxSyncWorker(store, "https://example.test", "token", send=fake_send)
+    assert worker.sync_once() == 1
+    saved = store.get(measurement.event_id)
+
+    assert sent_product_images == [
+        Path(measurement.product_image_path).read_bytes()
+    ]
+    assert saved is not None
+    assert saved.sync_status == "synced"
+    store.close()
+
+
+def test_outbox_keeps_failed_event_for_retry(tmp_path) -> None:
+    store = MeasurementStore(tmp_path / "measurements.db", tmp_path / "captures")
+    measurement = store.save(
+        "ROLL-RETRY-001",
+        75,
+        "kg",
+        np.zeros((40, 40, 3), dtype=np.uint8),
+        "manual",
+        needs_sync=True,
+    )
+
+    def fail(*args):
+        raise OSError("network offline")
+
+    worker = OutboxSyncWorker(store, "https://offline.test", "token", "station-01", send=fail)
+    assert worker.sync_once() == 0
+    saved = store.get(measurement.event_id)
+    assert saved is not None
+    assert saved.sync_status == "failed"
+    assert saved.retry_count == 1
+    assert store.pending_count() == 1
+    store.close()
+
+
+def test_background_worker_sends_pending_event_after_restart(tmp_path) -> None:
+    db = tmp_path / "measurements.db"
+    captures = tmp_path / "captures"
+    store = MeasurementStore(db, captures)
+    measurement = store.save(
+        "ROLL-RESTART-001",
+        1.25,
+        "kg",
+        np.zeros((40, 40, 3), dtype=np.uint8),
+        "manual",
+        needs_sync=True,
+    )
+    store.close()
+
+    reopened = MeasurementStore(db, captures)
+    sent = threading.Event()
+
+    def fake_send(url, payload, image_path, token):
+        sent.set()
+        return {
+            "ok": True,
+            "event_id": payload["event_id"],
+            "id": 503,
+            "image_url": "https://images.example/restarted.jpg",
+            "image_public_id": "roll-captures/restarted",
+        }
+
+    worker = OutboxSyncWorker(reopened, "https://example.test", "token", send=fake_send)
+    worker.start()
+    try:
+        assert sent.wait(3)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            saved = reopened.get(measurement.event_id)
+            if saved is not None and saved.sync_status == "synced":
+                break
+            time.sleep(0.01)
+        assert saved is not None and saved.sync_status == "synced"
+        assert saved.remote_id == 503
+    finally:
+        worker.stop()
+        reopened.close()
+
+
+def test_background_worker_includes_failed_events_for_scheduled_retry(tmp_path) -> None:
+    store = MeasurementStore(tmp_path / "measurements.db", tmp_path / "captures")
+    worker = OutboxSyncWorker(store, "https://example.test", "token", interval=0.01)
+    called = threading.Event()
+    retry_flags: list[bool] = []
+
+    def observe(*args, **kwargs):
+        retry_flags.append(bool(kwargs.get("retry_failed")))
+        called.set()
+        return 0
+
+    worker.sync_once = observe  # type: ignore[method-assign]
+    worker.start()
+    assert called.wait(1.0)
+    worker.stop()
+    store.close()
+
+    assert retry_flags and retry_flags[0] is True
+
+
+def test_backup_maintenance_is_opt_in_and_records_daily_result(tmp_path) -> None:
+    store = MeasurementStore(tmp_path / "measurements.db", tmp_path / "captures")
+    calls: list[tuple[str, str]] = []
+
+    def maintain(url, token):
+        calls.append((url, token))
+        return {"ok": True, "verified": 3, "cloudinary_deleted": 2}
+
+    worker = OutboxSyncWorker(
+        store,
+        "https://example.test",
+        "token",
+        maintenance_enabled=True,
+        maintenance_interval=86400,
+        maintenance=maintain,
+    )
+
+    assert worker.run_maintenance() is True
+    status = worker.maintenance_status()
+    assert calls == [("https://example.test", "token")]
+    assert status["enabled"] is True
+    assert status["last_success"] is not None
+    assert status["last_error"] is None
+    assert status["result"]["cloudinary_deleted"] == 2
+    store.close()
+
+
+def test_backup_maintenance_runs_immediately_when_worker_starts(tmp_path) -> None:
+    store = MeasurementStore(tmp_path / "measurements.db", tmp_path / "captures")
+    called = threading.Event()
+
+    def maintain(url, token):
+        called.set()
+        return {"ok": True}
+
+    worker = OutboxSyncWorker(
+        store,
+        "https://example.test",
+        "token",
+        interval=0.01,
+        maintenance_enabled=True,
+        maintenance=maintain,
+    )
+    worker.start()
+    assert called.wait(1.0)
+    worker.stop()
+    store.close()
+
+
+def test_backup_maintenance_sends_local_checksum_and_prunes_after_release(tmp_path) -> None:
+    now = datetime.now(timezone.utc)
+    store = MeasurementStore(tmp_path / "measurements.db", tmp_path / "captures")
+    measurement = store.save(
+        "ROLL-RETENTION-SYNC",
+        2.5,
+        "kg",
+        np.zeros((24, 24, 3), dtype=np.uint8),
+        "manual",
+        needs_sync=True,
+        event_id="33333333-3333-4333-8333-333333333333",
+        captured_at=(now - timedelta(days=8)).isoformat(),
+    )
+    store.mark_synced(
+        measurement.event_id,
+        301,
+        "https://res.cloudinary.com/demo/retention.jpg",
+        "retention",
+    )
+    reports: list[dict[str, object]] = []
+
+    def maintain(url, token, report):
+        reports.append(report)
+        item = report["items"][0]
+        return {
+            "ok": True,
+            "released": [
+                {
+                    "table": item["table"],
+                    "event_id": item["event_id"],
+                    "role": "core",
+                    "sha256": item["roles"]["core"]["sha256"],
+                }
+            ],
+        }
+
+    worker = OutboxSyncWorker(
+        store,
+        "https://example.test",
+        "token",
+        maintenance_enabled=True,
+        maintenance=maintain,
+    )
+    assert worker.run_maintenance() is True
+    assert reports and reports[0]["provider"] == "render_persistent_disk"
+    assert reports[0]["items"][0]["roles"]["core"]["bytes"] > 0
+    assert not Path(measurement.image_path).exists()
+    assert store.get(measurement.event_id) is not None
+    status = worker.maintenance_status()
+    assert status["result"]["local_prune"]["deleted"] == 1
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "response_factory",
+    [
+        lambda event_id: {"ok": False, "event_id": event_id},
+        lambda event_id: {"ok": True, "event_id": "different-event", "id": 1},
+        lambda event_id: {"event_id": event_id},
+        lambda event_id: {"ok": True, "event_id": event_id},
+        lambda event_id: {"ok": True, "event_id": event_id, "id": 0},
+        lambda event_id: {"ok": True, "event_id": event_id, "id": 1},
+    ],
+)
+def test_outbox_does_not_mark_unacknowledged_event_synced(tmp_path, response_factory) -> None:
+    store = MeasurementStore(tmp_path / "measurements.db", tmp_path / "captures")
+    measurement = store.save(
+        "ROLL-ACK-001",
+        22,
+        "kg",
+        np.zeros((20, 20, 3), dtype=np.uint8),
+        "manual",
+        needs_sync=True,
+    )
+
+    def fake_send(*args):
+        return response_factory(measurement.event_id)
+
+    worker = OutboxSyncWorker(store, "https://example.test", "token", "legacy-gateway", send=fake_send)
+    assert worker.sync_once() == 0
+    saved = store.get(measurement.event_id)
+    assert saved is not None
+    assert saved.sync_status == "failed"
+    assert saved.retry_count == 1
+    store.close()
+
+
+def test_outbox_can_allow_legacy_ack_without_image_when_explicitly_configured(tmp_path) -> None:
+    store = MeasurementStore(tmp_path / "measurements.db", tmp_path / "captures")
+    measurement = store.save(
+        "ROLL-LEGACY-ACK",
+        3,
+        "kg",
+        np.zeros((20, 20, 3), dtype=np.uint8),
+        "manual",
+        needs_sync=True,
+    )
+
+    def fake_send(*args):
+        return {
+            "ok": True,
+            "event_id": measurement.event_id,
+            "id": "7",
+            "local_backup_committed": True,
+        }
+
+    worker = OutboxSyncWorker(
+        store,
+        "https://example.test",
+        "token",
+        "legacy-gateway",
+        send=fake_send,
+        require_remote_image=False,
+    )
+    assert worker.sync_once() == 1
+    saved = store.get(measurement.event_id)
+    assert saved is not None
+    assert saved.sync_status == "synced"
+    assert saved.remote_id == 7
+    store.close()
+
+
+def test_outbox_keeps_local_ack_cloudinary_pending_for_retry(tmp_path) -> None:
+    store = MeasurementStore(tmp_path / "measurements.db", tmp_path / "captures")
+    measurement = store.save(
+        "ROLL-CLOUDINARY-PENDING",
+        3,
+        "kg",
+        np.zeros((20, 20, 3), dtype=np.uint8),
+        "manual",
+        needs_sync=True,
+    )
+
+    def fake_send(*args):
+        return {
+            "ok": True,
+            "event_id": measurement.event_id,
+            "id": 9,
+            "local_backup_committed": True,
+            "cloudinary_pending": True,
+        }
+
+    worker = OutboxSyncWorker(store, "https://example.test", "token", send=fake_send)
+    assert worker.sync_once() == 1
+    saved = store.get(measurement.event_id)
+    assert saved is not None
+    assert saved.sync_status == "synced"
+    assert saved.sync_error == "cloudinary_pending"
+    assert store.pending_count() == 1
+    store.close()
+
+
+def test_outbox_skips_cloudinary_when_include_images_disabled(tmp_path) -> None:
+    store = MeasurementStore(tmp_path / "measurements.db", tmp_path / "captures")
+    measurement = store.save(
+        "ROLL-SKIP-CLOUDINARY",
+        3,
+        "kg",
+        np.zeros((20, 20, 3), dtype=np.uint8),
+        "manual",
+        needs_sync=True,
+    )
+    sent: dict = {}
+
+    def fake_send(url, payload, image_path, token, *, include_images=True):
+        sent.update(
+            url=url,
+            payload=dict(payload),
+            image_path=image_path,
+            token=token,
+            include_images=include_images,
+        )
+        return {
+            "ok": True,
+            "event_id": measurement.event_id,
+            "id": 42,
+            "local_backup_committed": True,
+            "cloudinary_skipped": True,
+            "cloudinary_pending": False,
+        }
+
+    worker = OutboxSyncWorker(
+        store,
+        "https://example.test",
+        "token",
+        "gateway-skip",
+        send=fake_send,
+        require_remote_image=False,
+        include_images=False,
+    )
+    assert worker.sync_once() == 1
+    saved = store.get(measurement.event_id)
+    assert saved is not None
+    assert saved.sync_status == "synced"
+    assert saved.sync_error in {"", None}
+    assert sent["include_images"] is False
+    assert sent["payload"].get("skip_cloudinary") is True
+    assert "product_image_base64" not in sent["payload"]
+    assert store.pending_count() == 0
+    store.close()
+
+
+def test_http_client_sends_image_and_device_token(tmp_path) -> None:
+    received: dict = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers["content-length"])
+            received["token"] = self.headers["x-device-token"]
+            received["body"] = json.loads(self.rfile.read(length))
+            response = json.dumps(
+                {"ok": True, "event_id": "test-event", "id": 321}
+            ).encode()
+            self.send_response(201)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format, *args):
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    image_path = tmp_path / "capture.jpg"
+    image_path.write_bytes(b"\xff\xd8test-jpeg\xff\xd9")
+    product_image = b"\xff\xd8test-product-jpeg\xff\xd9"
+    try:
+        response = post_measurement(
+            f"http://127.0.0.1:{server.server_port}/ingest",
+            {
+                "event_id": "test-event",
+                "qr_code": "ROLL-HTTP-001",
+                "product_image_base64": base64.b64encode(product_image).decode("ascii"),
+                "product_weight": 13.04,
+            },
+            image_path,
+            "secret-token",
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response["id"] == 321
+    assert received["token"] == "secret-token"
+    assert base64.b64decode(received["body"]["image_base64"]) == image_path.read_bytes()
+    assert received["body"]["image_role"] == "core_weight"
+    assert base64.b64decode(received["body"]["product_image_base64"]) == product_image
+    assert received["body"]["product_weight"] == pytest.approx(13.04)
